@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 models = ['persistence', 'train_mean', 'cnn', 'patchtst']
 output = Path('results/mitbih-seed42')
 output.mkdir(parents=True, exist_ok=True)
+shutil.copy('results/environment.txt', output/'environment.txt')
 results = {}
 for model in models:
     run = Path(f'runs/mitbih-{model}-seed42')
@@ -18,7 +19,8 @@ for model in models:
         raise ValueError('This report requires real-data runs without --limit')
     results[model] = metrics
     shutil.copy(run/'metrics.json', output/f'{model}.json')
-    if (run/'train.log').exists(): shutil.copy(run/'train.log', output/f'{model}.log')
+    log = Path(f'runs/mitbih-{model}-seed42.log')
+    if log.exists(): shutil.copy(log, output/f'{model}.log')
 assert len({r['manifest_sha256'] for r in results.values()}) == 1
 assert len({json.dumps(r['windows'],sort_keys=True) for r in results.values()}) == 1
 fig,ax = plt.subplots(figsize=(7,4))
