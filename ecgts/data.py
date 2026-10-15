@@ -1,6 +1,8 @@
 from pathlib import Path
 import json
 import hashlib
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from torch.utils.data import Dataset
 
@@ -29,10 +31,35 @@ def prepare(root, synthetic=False):
         raw.mkdir(exist_ok=True)
         records = sum(splits.values(), [])
         missing = [r for r in records if not (root / f'{r}.npy').exists()]
+        # Official public PhysioNet S3 distribution; same MIT-BIH 1.0.0 files.
+        # Keep only two concurrent downloads, write atomically, retain raw hashes.
+        def download_file(name):
+            destination = raw / name
+            if destination.exists(): return
+            url = 'https://physionet-open.s3.amazonaws.com/mitdb/1.0.0/' + name
+            with urllib.request.urlopen(url, timeout=60) as response:
+                payload = response.read()
+                expected = response.headers.get('Content-Length')
+                etag = response.headers.get('ETag', '').strip('"')
+            if expected and len(payload) != int(expected):
+                raise ValueError(f'Truncated download: {name}')
+            if len(etag) == 32 and hashlib.md5(payload).hexdigest() != etag:
+                raise ValueError(f'ETag mismatch: {name}')
+            temporary = destination.with_suffix(destination.suffix + '.part')
+            temporary.write_bytes(payload)
+            temporary.replace(destination)
+            print(f'Downloaded {name}: {len(payload)} bytes', flush=True)
         if missing:
-            wfdb.dl_database('mitdb', dl_dir=str(raw), records=missing, annotators=[])
+            names = [r+ext for r in missing for ext in ('.hea', '.dat')]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(download_file, names))
         for record in records:
             if not (root / f'{record}.npy').exists():
+                digital = wfdb.rdrecord(str(raw / record), physical=False)
+                actual = np.sum(digital.d_signal, axis=0, dtype=np.int64) % 65536
+                expected = np.array(digital.checksum, dtype=np.int64) % 65536
+                if not np.array_equal(actual, expected):
+                    raise ValueError(f'WFDB signal checksum mismatch: {record}')
                 ecg = wfdb.rdrecord(str(raw / record))
                 if 'MLII' not in ecg.sig_name or ecg.fs != 360:
                     raise ValueError(f'Unexpected lead/rate: {record} {ecg.sig_name} {ecg.fs}')
@@ -53,6 +80,8 @@ def prepare(root, synthetic=False):
         if a.ndim != 1 or not np.isfinite(a).all():
             raise ValueError(f'Invalid signal: {record}')
         manifest['records'][record] = dict(samples=int(a.size), npy_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    manifest['download_mirror'] = None if synthetic else 'https://physionet-open.s3.amazonaws.com/mitdb/1.0.0/'
+    manifest['raw_sha256'] = {} if synthetic else {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((root/'raw').glob('*')) if p.suffix in ('.hea', '.dat')}
     manifest['source'] = 'synthetic' if synthetic else 'https://physionet.org/content/mitdb/1.0.0/'
     (root/'manifest.json').write_text(json.dumps(manifest, indent=2))
     return manifest
