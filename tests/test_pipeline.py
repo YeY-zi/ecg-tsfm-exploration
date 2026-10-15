@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from ecgts.data import prepare, Windows, SPLITS
 from ecgts.models import build
+from ecgts.run import evaluate
+from torch.utils.data import DataLoader
 
 
 class PipelineTests(unittest.TestCase):
@@ -25,6 +27,19 @@ class PipelineTests(unittest.TestCase):
             np.testing.assert_allclose(y,(a[256:320]-meta['mean'])/meta['std'])
             self.assertEqual(len(ds), (len(a)-320)//128+1)
             self.assertEqual(x.shape,(256,))
+
+    def test_record_metrics_match_global(self):
+        with tempfile.TemporaryDirectory() as root:
+            prepare(root, True)
+            ds = Windows(root, 'test', 32, 8, 16, 7)
+            class Zero(torch.nn.Module):
+                def forward(self, x): return torch.zeros(len(x), 8)
+            metrics = evaluate(Zero(), DataLoader(ds, batch_size=3), 'cpu', by_record=True)
+            expected = np.concatenate([ds[i][1] for i in range(len(ds))])
+            self.assertAlmostEqual(metrics['mse'], float((expected**2).mean()), places=5)
+            self.assertAlmostEqual(metrics['mae'], float(np.abs(expected).mean()), places=5)
+            self.assertEqual(metrics['per_record']['toy_test']['windows'], 7)
+            self.assertEqual(metrics['macro_record_mse'], metrics['mse'])
 
     def test_models_gradients(self):
         torch.set_num_threads(1)

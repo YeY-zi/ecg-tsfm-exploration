@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import hashlib
 import numpy as np
 from torch.utils.data import Dataset
 
@@ -26,9 +27,12 @@ def prepare(root, synthetic=False):
         splits = SPLITS
         raw = root / 'raw'
         raw.mkdir(exist_ok=True)
-        for record in sum(splits.values(), []):
+        records = sum(splits.values(), [])
+        missing = [r for r in records if not (root / f'{r}.npy').exists()]
+        if missing:
+            wfdb.dl_database('mitdb', dl_dir=str(raw), records=missing, annotators=[])
+        for record in records:
             if not (root / f'{record}.npy').exists():
-                wfdb.dl_database('mitdb', dl_dir=str(raw), records=[record], annotators=[])
                 ecg = wfdb.rdrecord(str(raw / record))
                 if 'MLII' not in ecg.sig_name or ecg.fs != 360:
                     raise ValueError(f'Unexpected lead/rate: {record} {ecg.sig_name} {ecg.fs}')
@@ -42,6 +46,14 @@ def prepare(root, synthetic=False):
         raise ValueError('Invalid training statistics')
     manifest = dict(synthetic=synthetic, fs=360, channel='MLII' if not synthetic else 'synthetic',
                     splits=splits, mean=float(mean), std=float(std))
+    manifest['records'] = {}
+    for record in sum(splits.values(), []):
+        path = root / f'{record}.npy'
+        a = np.load(path)
+        if a.ndim != 1 or not np.isfinite(a).all():
+            raise ValueError(f'Invalid signal: {record}')
+        manifest['records'][record] = dict(samples=int(a.size), npy_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    manifest['source'] = 'synthetic' if synthetic else 'https://physionet.org/content/mitdb/1.0.0/'
     (root/'manifest.json').write_text(json.dumps(manifest, indent=2))
     return manifest
 
@@ -52,6 +64,7 @@ class Windows(Dataset):
             raise ValueError('Window dimensions must be positive')
         root = Path(root)
         meta = json.loads((root/'manifest.json').read_text())
+        self.records = meta['splits'][split]
         self.arrays, self.index = [], []
         self.context, self.horizon = context, horizon
         for record in meta['splits'][split]:
