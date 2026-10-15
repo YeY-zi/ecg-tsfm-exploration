@@ -1,0 +1,7 @@
+{
+  "record": "213",
+  "start_sample": 59904,
+  "start_seconds": 166.4,
+  "patchtst_mse": 12.340559005737305,
+  "selection": "Highest PatchTST window MSE within the highest PatchTST record-MSE test record; post-hoc, not typical."
+}

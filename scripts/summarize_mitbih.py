@@ -2,6 +2,11 @@
 import json
 from pathlib import Path
 import shutil
+import sys
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+import torch
+from ecgts.models import build
+from ecgts.data import Windows
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -43,6 +48,46 @@ ax.plot(np.arange(len(x),len(x)+len(y))/360,y,color='black',label='target')
 ax.axvline(len(x)/360,color='gray',linestyle='--'); ax.legend()
 ax.set(xlabel='Seconds',ylabel='Normalized MLII',title='First test window: record 100, start sample 0 (not selected by error)')
 fig.tight_layout(); fig.savefig(output/'first-window.png',dpi=160); plt.close(fig)
+# Explicitly selected hard example: highest-error window in the worst record.
+torch.set_num_threads(2)
+worst_record = max(results['patchtst']['test']['per_record'],key=lambda r: results['patchtst']['test']['per_record'][r]['mse'])
+reference = results['patchtst']['args']
+ds = Windows(reference['data'],'test',reference['context'],reference['horizon'],reference['stride'])
+selected = [i for i,(record,_) in enumerate(ds.index) if ds.records[record] == worst_record]
+net = build('patchtst',reference['context'],reference['horizon'])
+net.load_state_dict(torch.load('runs/mitbih-patchtst-seed42/best.pt',map_location='cpu',weights_only=True))
+net.eval()
+worst = (-1.0,None)
+with torch.inference_mode():
+    for offset in range(0,len(selected),64):
+        ids = selected[offset:offset+64]
+        x = torch.from_numpy(np.stack([ds[i][0] for i in ids]))
+        y = torch.from_numpy(np.stack([ds[i][1] for i in ids]))
+        error = (net(x)-y).square().mean(dim=1)
+        value,loc = error.max(dim=0)
+        if value.item() > worst[0]: worst = (value.item(),ids[loc.item()])
+index = worst[1]
+x,y = ds[index]
+start = ds.index[index][1]
+fig,ax = plt.subplots(figsize=(9,4))
+ax.plot(np.arange(len(x))/360,x,color='gray',label='context')
+future_t = np.arange(len(x),len(x)+len(y))/360
+ax.plot(future_t,y,color='black',linewidth=2,label='target')
+with torch.inference_mode():
+    for name in ('cnn','patchtst'):
+        net = build(name,reference['context'],reference['horizon'])
+        net.load_state_dict(torch.load(f'runs/mitbih-{name}-seed42/best.pt',map_location='cpu',weights_only=True))
+        net.eval()
+        prediction = net(torch.from_numpy(x[None,:])).numpy()[0]
+        ax.plot(future_t,prediction,label=name)
+ax.plot(future_t,np.full(len(y),x[-1]),linestyle=':',label='persistence')
+ax.axvline(len(x)/360,color='gray',linestyle='--')
+ax.set(xlabel='Seconds relative to window start',ylabel='Normalized MLII',
+       title=f'Selected extreme: record {worst_record}, start {start}, PatchTST MSE={worst[0]:.3f}')
+ax.legend(); fig.tight_layout(); fig.savefig(output/'selected-hard-window.png',dpi=160); plt.close(fig)
+hard_example = dict(record=worst_record,start_sample=start,start_seconds=start/360,patchtst_mse=worst[0],
+                    selection='Highest PatchTST window MSE within the highest PatchTST record-MSE test record; post-hoc, not typical.')
+(output/'selected-hard-window.json').write_text(json.dumps(hard_example,indent=2))
 lines=['# MIT-BIH 首次真实数据实验','',
     '日期：2026-10-15。单次 seed=42 探索性实验，不是论文原始指标复现或基础模型评估。','',
     '## 固定实验协议','',
@@ -61,13 +106,24 @@ lines=['# MIT-BIH 首次真实数据实验','',
 for m,r in results.items():
     lines.append(f"| {m} | {r['best_epoch'] or 'N/A'} | {r['validation']['mse']:.6f} | {r['test']['mse']:.6f} | {r['test']['mae']:.6f} | {r['test']['macro_record_mse']:.6f} | {r['elapsed_seconds']:.1f} |")
 lines += ['', 'MSE/MAE 单位基于训练集标准差归一化；MSE 乘 std²、MAE 乘 std 可转换回原信号单位。训练均值基线始终输出归一化后的 0。','',
-    '![Test error](test-mse.png)','![Validation](validation.png)','![First window](first-window.png)','',
+    '![Test error](test-mse.png)','![Validation](validation.png)','![First window](first-window.png)','',f"极端案例选择：记录 {worst_record}，起点 sample={start}（记录内 {start/360:.3f} 秒），窗口 PatchTST-style MSE={worst[0]:.6f}。先选该模型记录均误差最高的测试记录，再选其中窗口误差最高者；非典型样本，未用于调参。",'','![Selected hard window](selected-hard-window.png)','',
     '## 逐记录结果与失败案例','',
     '以下按 PatchTST-style 测试 MSE 从大到小展示全部测试记录；属于事后误差分析，未据此重新训练。','',
     '| 测试记录 | Persistence MSE | Mean MSE | CNN MSE | PatchTST-style MSE |','|---|---:|---:|---:|---:|']
 records=sorted(results['patchtst']['test']['per_record'],key=lambda k: -results['patchtst']['test']['per_record'][k]['mse'])
 for rec in records:
     lines.append('| '+rec+' | '+' | '.join(f"{results[m]['test']['per_record'][rec]['mse']:.6f}" for m in models)+' |')
+baseline_mse = results['persistence']['test']['mse']
+cnn_mse = results['cnn']['test']['mse']
+patch_mse = results['patchtst']['test']['mse']
+better_records = sum(results['patchtst']['test']['per_record'][r]['mse'] < results['cnn']['test']['per_record'][r]['mse'] for r in records)
+worse_records = [r for r in records if results['patchtst']['test']['per_record'][r]['mse'] >= results['cnn']['test']['per_record'][r]['mse']]
+lines += ['', '## 本次观察','',
+    f'- PatchTST-style 测试 MSE 比 persistence 低 {1-patch_mse/baseline_mse:.2%}，比 CNN 低 {1-patch_mse/cnn_mse:.2%}。',
+    f'- PatchTST-style 在 {better_records}/{len(records)} 条测试记录上 MSE 低于 CNN；未优于 CNN 的记录为 {worse_records}。这不是多种子显著性检验。',
+    f'- 按 PatchTST-style 记录均误差选择的困难记录为 {worst_record}。所示极端窗口中，两种训练模型均明显低估目标高幅波形；总体误差改善不代表峰值预测已解决。',
+    '- CNN 与 PatchTST-style 的最佳验证 checkpoint 都是第 5 轮，尚不能判断模型已收敛。',
+    '- 后续可以预先定义峰值区域评价、延长训练预算和多种子协议；本次没有根据测试结果更改模型或重新训练。']
 lines += ['', '## 解释范围','',
     '- 本次只有一个随机种子、一个窗口配置、5 轮训练；不能据此判断模型家族的普遍优劣。',
     '- 验证集仅一条记录，选模可能不稳定，未来应采用多受试者验证或交叉验证。',

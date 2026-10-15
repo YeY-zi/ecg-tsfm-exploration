@@ -1,0 +1,6 @@
+Architecture:                            x86_64
+CPU(s):                                  3
+Model name:                              AMD EPYC 9V74 80-Core Processor
+Thread(s) per core:                      1
+Core(s) per socket:                      3
+Socket(s):                               1
